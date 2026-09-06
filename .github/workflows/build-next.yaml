@@ -62,7 +62,6 @@ jobs:
         run: chmod +x gradlew
 
       - name: Decode signing keystore
-        if: ${{ secrets.STORE_BASE64 != '' }}
         env:
           STORE_FILE: ${{ secrets.STORE_FILE }}
           STORE_BASE64: ${{ secrets.STORE_BASE64 }}
