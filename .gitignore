@@ -1,1 +1,5 @@
 **/docs/superpowers
+
+# Signing keystores
+*.jks
+*.keystore

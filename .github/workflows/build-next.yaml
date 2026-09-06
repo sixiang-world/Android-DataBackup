@@ -61,8 +61,26 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      - name: Decode signing keystore
+        if: ${{ secrets.STORE_BASE64 != '' }}
+        env:
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          STORE_BASE64: ${{ secrets.STORE_BASE64 }}
+        run: |
+          if [ -n "$STORE_BASE64" ] && [ -n "$STORE_FILE" ]; then
+            echo "$STORE_BASE64" | base64 -di > "./app/${STORE_FILE}"
+            echo "Keystore decoded: ./app/${STORE_FILE}"
+          else
+            echo "No signing keystore configured, using debug signature"
+          fi
+
       - name: Build with gradle
         id: gradle
+        env:
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
             ./gradlew assembleDebug --parallel
