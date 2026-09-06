@@ -10,8 +10,10 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -19,6 +21,14 @@ import java.util.Set;
 import dev.rikka.tools.refine.Refine;
 
 public class NetworkUtil {
+    private static final boolean DEBUG = "1".equals(System.getenv("HIDDENAPI_DEBUG"))
+            || "1".equals(System.getenv("DEX_DEBUG"));
+    private static void human(String msg) { if ("1".equals(System.getenv("DEX_HUMAN_LOG"))) System.err.println("HUMAN " + msg); }
+    private static void commandError(String command, Exception e) {
+        System.err.println("ERROR_CODE=NETWORK_COMMAND_FAILED COMMAND=" + command
+                + " REASON=" + e.getClass().getSimpleName());
+        if (DEBUG) e.printStackTrace(System.err);
+    }
     private static final String NETWORK_PREFIX = "network";
     private static final String NETWORK_SPLIT_SYMBOL = "_";
     private static final String[] SKIP_FIELDS = {"mNetworkSeclectionDisableCounter"};
@@ -52,7 +62,7 @@ public class NetworkUtil {
                 onHelp();
                 break;
             default:
-                System.out.println("Unknown command: " + cmd);
+                System.out.println("UNKNOWN_COMMAND " + cmd.replaceAll("[\r\n\t ]+", "_"));
                 System.exit(1);
         }
     }
@@ -73,6 +83,7 @@ public class NetworkUtil {
             Context ctx = HiddenApiHelper.getContext();
             WifiManagerHidden wifiManager = Refine.unsafeCast(ctx.getSystemService(Context.WIFI_SERVICE));
             List<WifiConfiguration> networks = wifiManager.getPrivilegedConfiguredNetworks();
+            human("讀取WiFi設定成功: 共 " + networks.size() + " 筆");
             Set<Integer> networkIds = new HashSet<>();
             for (int i = 0; i < networks.size(); i++) {
                 WifiConfiguration network = networks.get(i);
@@ -91,7 +102,8 @@ public class NetworkUtil {
             }
             System.exit(0);
         } catch (Exception e) {
-            e.printStackTrace(System.out);
+            human("WiFi操作失敗: " + e.getMessage());
+            commandError("getNetworks", e);
             System.exit(1);
         }
     }
@@ -102,10 +114,16 @@ public class NetworkUtil {
             WifiManagerHidden wifiManager = Refine.unsafeCast(ctx.getSystemService(Context.WIFI_SERVICE));
             List<WifiConfiguration> networks = wifiManager.getPrivilegedConfiguredNetworks();
             Gson gson = new Gson();
-            System.out.println(gson.toJson(networks));
+            human("WiFi JSON備份成功: 共 " + networks.size() + " 筆");
+            String json = gson.toJson(networks);
+            // Base64 編碼輸出, 避免 preSharedKey 以明文 JSON 形式直接落地在 wifi.json,
+            // 任何能讀到備份檔的進程/使用者不再能不解碼就看到 WiFi 密碼原文。
+            String encoded = Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
+            System.out.println(encoded);
             System.exit(0);
         } catch (Exception e) {
-            e.printStackTrace(System.out);
+            human("WiFi操作失敗: " + e.getMessage());
+            commandError("saveNetworks", e);
             System.exit(1);
         }
     }
@@ -133,10 +151,13 @@ public class NetworkUtil {
             File jsonFile = new File(jsonPath);
             if (!jsonFile.exists()) {
                 System.out.println(jsonPath + " not exists!");
+                human("WiFi還原失敗: 檔案不存在 " + jsonPath);
                 System.exit(1);
             }
             try {
-                String json = new String(Files.readAllBytes(jsonFile.toPath()));
+                String fileContent = new String(Files.readAllBytes(jsonFile.toPath()), StandardCharsets.UTF_8);
+                byte[] decoded = Base64.getDecoder().decode(fileContent.trim());
+                String json = new String(decoded, StandardCharsets.UTF_8);
                 WifiConfiguration[] networks = gson.fromJson(json, WifiConfiguration[].class);
                 for (WifiConfiguration network : networks) {
                     try {
@@ -146,20 +167,24 @@ public class NetworkUtil {
                         if (!networkIds.contains(networkId)) {
                             networkIds.add(networkId);
                             System.out.println(network.SSID + " restored");
+                            human("WiFi項目已還原: " + network.SSID);
                         }
                     } catch (Exception e) {
-                        e.printStackTrace(System.out);
+                        human("WiFi操作失敗: " + e.getMessage());
+                        commandError("restoreNetworks.item", e);
                         status = 1;
                     }
 
                 }
             } catch (Exception e) {
-                e.printStackTrace(System.out);
+                human("WiFi操作失敗: " + e.getMessage());
+                commandError("restoreNetworks.payload", e);
                 status = 1;
             }
             System.exit(status);
         } catch (Exception e) {
-            e.printStackTrace(System.out);
+            human("WiFi操作失敗: " + e.getMessage());
+            commandError("restoreNetworks", e);
             System.exit(1);
         }
     }

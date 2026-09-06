@@ -1,0 +1,1030 @@
+package com.xayah.dex;
+
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.PackageManagerHidden;
+import android.os.Build;
+import android.os.UserHandleHidden;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.Collator;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.zip.ZipFile;
+import java.lang.reflect.Method;
+
+import dev.rikka.tools.refine.Refine;
+
+/**
+ * SpeedBackup App inventory snapshot.
+ *
+ * One PackageManager scan provides label/pkg/uid/version/source/flag/category data for shell.
+ * In a persistent root daemon this class keeps a per-user/per-locale cache for the current run.
+ */
+final class AppInventoryUtil {
+    static final String VERSION = "v1.3.14-r480-pre-restore-package-state";
+    private static final String XPOSED_METADATA = "xposedminversion";
+    private static final Gson GSON = new Gson();
+    private static final Map<String, List<Item>> CACHE = new HashMap<>();
+
+    private AppInventoryUtil() {}
+
+    static synchronized String runCommand(String[] args) throws Exception {
+        if (args == null || args.length < 2) {
+            return "APP_INVENTORY_BAD_ARGS appInventorySnapshot USER_ID [jsonl|appinfo|pkgName|pkgVerMap|pkgUidMap|pkgEnabledMap|sourceDirMap|splitSourceDirsMap|pkgApkPathMap] [user|system|xposed|all] [refresh]\n";
+        }
+        int userId = parseInt(args[1], 0);
+        String format = args.length >= 3 && args[2] != null && !args[2].isEmpty() ? args[2] : "jsonl";
+        String filter = args.length >= 4 && args[3] != null && !args[3].isEmpty() ? args[3] : "all";
+        boolean refresh = false;
+        for (String a : args) {
+            if ("refresh".equalsIgnoreCase(a) || "--refresh".equalsIgnoreCase(a)) {
+                refresh = true;
+                break;
+            }
+        }
+        return render(userId, format, filter, refresh);
+    }
+
+    static synchronized String runGetlistCommand(String[] args) throws Exception {
+        if (args == null || args.length < 2) {
+            return "APP_INVENTORY_GETLIST_BAD_ARGS appInventoryGetlist USER_ID [targetPackageCsv] [refresh]\n";
+        }
+        int userId = parseInt(args[1], 0);
+        String targetCsv = args.length >= 3 && args[2] != null ? args[2] : "";
+        boolean refresh = false;
+        for (String a : args) {
+            if ("refresh".equalsIgnoreCase(a) || "--refresh".equalsIgnoreCase(a)) {
+                refresh = true;
+                break;
+            }
+        }
+        List<Item> items = snapshot(userId, refresh);
+        HomeInfo home = defaultHomeInfo(userId);
+        ImeInfo ime = defaultImeInfo(userId);
+        Set<String> targets = parsePackageSet(targetCsv);
+        if (!home.packageName.isEmpty()) targets.add(home.packageName);
+        if (!ime.packageName.isEmpty()) targets.add(ime.packageName);
+        StringBuilder out = new StringBuilder(items.size() * 64);
+        out.append("#META\tdefaultHome\t")
+                .append(sanitize(home.packageName)).append('\t')
+                .append(sanitize(home.label)).append('\t')
+                .append(sanitize(home.source)).append('\n');
+        out.append("#META\tdefaultIme\t")
+                .append(sanitize(ime.packageName)).append('\t')
+                .append(sanitize(ime.label)).append('\t')
+                .append(sanitize(ime.source)).append('\n');
+        for (Item item : items) {
+            if (item == null || item.packageName == null || item.packageName.isEmpty()) continue;
+            boolean include = !item.system || item.xposed || targets.contains(item.packageName);
+            if (!include) continue;
+            out.append(removeSpaces(item.label)).append(' ')
+                    .append(item.packageName).append(' ')
+                    .append(item.flag).append('\n');
+        }
+        return out.toString();
+    }
+
+    static synchronized String render(int userId, String format, String filter, boolean refresh) throws Exception {
+        List<Item> items = snapshot(userId, refresh);
+        StringBuilder out = new StringBuilder(items.size() * 96);
+        for (Item item : items) {
+            if (!matchesFilter(item, filter)) continue;
+            switch (format) {
+                case "pkgName":
+                    out.append(item.packageName).append('\n');
+                    break;
+                case "pkgVerMap":
+                    if (item.versionCode >= 0) {
+                        out.append(item.packageName).append('\t').append(item.versionCode).append('\n');
+                    }
+                    break;
+                case "pkgUidMap":
+                    if (item.uid >= 0) {
+                        out.append(item.packageName).append('\t').append(item.uid).append('\n');
+                    }
+                    break;
+                case "pkgEnabledMap":
+                    out.append(item.packageName).append('\t').append(item.enabled ? "true" : "false").append('\n');
+                    break;
+                case "sourceDirMap":
+                    if (item.sourceDir != null && !item.sourceDir.isEmpty()) {
+                        out.append(item.packageName).append('\t').append(item.sourceDir).append('\n');
+                    }
+                    break;
+                case "splitSourceDirsMap":
+                    if (item.splitSourceDirs != null && item.splitSourceDirs.length > 0) {
+                        out.append(item.packageName).append('\t').append(String.join("|", item.splitSourceDirs)).append('\n');
+                    }
+                    break;
+                case "pkgApkPathMap":
+                    if (item.sourceDir != null && !item.sourceDir.isEmpty()) {
+                        out.append(item.packageName).append('\t').append(item.sourceDir).append('\n');
+                    }
+                    if (item.splitSourceDirs != null) {
+                        for (String split : item.splitSourceDirs) {
+                            if (split != null && !split.isEmpty()) {
+                                out.append(item.packageName).append('\t').append(split).append('\n');
+                            }
+                        }
+                    }
+                    break;
+                case "appinfo":
+                    out.append(removeSpaces(item.label)).append(' ')
+                            .append(item.packageName).append(' ')
+                            .append(item.flag).append('\n');
+                    break;
+                case "jsonl":
+                default:
+                    out.append(GSON.toJson(item.toJson())).append('\n');
+                    break;
+            }
+        }
+        return out.toString();
+    }
+
+
+
+    static synchronized String pkgUidSingle(int userId, String packageName, boolean refresh) throws Exception {
+        if (packageName == null || packageName.trim().isEmpty()) {
+            return "APP_INVENTORY_PKG_UID_BAD_ARGS appInventoryPkgUid USER_ID PACKAGE [refresh]\n";
+        }
+        String pkgName = packageName.trim();
+        if (refresh) {
+            clearCache();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        try {
+            PackageInfo pkg = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, userId);
+            Item item = toItem(pm, pkg, userId);
+            if (item != null && item.uid >= 0) {
+                return item.packageName + "\t" + item.uid + "\n";
+            }
+            return "APP_INVENTORY_PKG_UID_MISSING package=" + sanitize(pkgName) + " userId=" + userId + " reason=uid_missing\n";
+        } catch (Throwable t) {
+            return "APP_INVENTORY_PKG_UID_MISSING package=" + sanitize(pkgName) + " userId=" + userId
+                    + " reason=" + sanitize(t.getClass().getSimpleName()) + "\n";
+        }
+    }
+
+    static synchronized String packageStatusSingle(int userId, String packageName, boolean refresh) throws Exception {
+        if (packageName == null || packageName.trim().isEmpty()) {
+            return statusMissing(userId, packageName, "BAD_ARGS");
+        }
+        String pkgName = packageName.trim();
+        if (refresh) {
+            clearCache();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        try {
+            PackageInfo pkg = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, userId);
+            Item item = toItem(pm, pkg, userId);
+            if (item == null) {
+                return statusMissing(userId, pkgName, "ITEM_NULL");
+            }
+            JsonObject o = item.toJson();
+            o.addProperty("schema", "speedbackup.package_status.v1");
+            o.addProperty("recordType", "packageStatus");
+            o.addProperty("source", "packageManager");
+            o.addProperty("reason", "OK");
+            o.addProperty("suspended", false);
+            addDataDirs(o, userId, item.packageName);
+            return GSON.toJson(o) + "\n";
+        } catch (Throwable t) {
+            return statusMissing(userId, pkgName, t.getClass().getSimpleName());
+        }
+    }
+
+    static synchronized String packageStatusBatch(int userId, String[] packageNames, boolean refresh) throws Exception {
+        if (refresh) {
+            clearCache();
+        }
+        StringBuilder out = new StringBuilder();
+        if (packageNames == null || packageNames.length == 0) {
+            return statusMissing(userId, "", "BAD_ARGS");
+        }
+        boolean any = false;
+        for (String raw : packageNames) {
+            if (raw == null) continue;
+            String pkg = raw.trim();
+            if (pkg.isEmpty() || "refresh".equalsIgnoreCase(pkg) || "--refresh".equalsIgnoreCase(pkg)) continue;
+            any = true;
+            out.append(packageStatusSingle(userId, pkg, false));
+        }
+        if (!any) out.append(statusMissing(userId, "", "BAD_ARGS"));
+        return out.toString();
+    }
+
+
+
+    static synchronized String packageFactsSingle(int userId, String packageName, boolean refresh) throws Exception {
+        if (packageName == null || packageName.trim().isEmpty()) {
+            return packageFactsBatch(userId, new String[]{""}, refresh);
+        }
+        return packageFactsBatch(userId, new String[]{packageName.trim()}, refresh);
+    }
+
+    static synchronized String packageInstalledUsersFacts(String packageName, int maxUserId, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        String pkgName = packageName == null ? "" : packageName.trim();
+        if (maxUserId < 0) maxUserId = 0;
+        if (maxUserId > 99) maxUserId = 99;
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.pm_installed_users.v1\n");
+        out.append("#fields\tpackage\tuserId\tinstalled\tuid\tenabled\tversionCode\treason\n");
+        if (pkgName.isEmpty()) {
+            out.append("MISSING\t\t0\tfalse\t-1\tfalse\t-1\tBAD_ARGS\n");
+            return out.toString();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        boolean any = false;
+        for (int u = 0; u <= maxUserId; u++) {
+            try {
+                PackageInfo pi = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, u);
+                Item item = toItem(pm, pi, u);
+                if (item != null && item.installed) {
+                    any = true;
+                    out.append("OK\t").append(sanitize(pkgName)).append('\t').append(u).append("\ttrue\t")
+                            .append(item.uid).append('\t').append(item.enabled ? "true" : "false").append('\t')
+                            .append(item.versionCode).append("\tOK\n");
+                }
+            } catch (Throwable ignored) {
+                // keep output compact: only installed users are rows; final MISS row below if none.
+            }
+        }
+        if (!any) out.append("MISSING\t").append(sanitize(pkgName)).append("\t-1\tfalse\t-1\tfalse\t-1\tNOT_INSTALLED_0_").append(maxUserId).append('\n');
+        return out.toString();
+    }
+
+    static synchronized String packageVisibleAfterInstallFacts(int userId, String packageName, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.pm_visible_after_install.v1\n");
+        out.append("#fields\tpackage\tuserId\tvisible\tinstalled\tuid\tenabled\tversionCode\tuserDataExists\tuserDeDataExists\treason\n");
+        String pkgName = packageName == null ? "" : packageName.trim();
+        if (pkgName.isEmpty()) {
+            out.append("MISSING\t\t").append(userId).append("\tfalse\tfalse\t-1\tfalse\t-1\tfalse\tfalse\tBAD_ARGS\n");
+            return out.toString();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        try {
+            PackageInfo pi = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, userId);
+            Item item = toItem(pm, pi, userId);
+            if (item == null) throw new IllegalStateException("ITEM_NULL");
+            String userDataDir = "/data/user/" + userId + "/" + pkgName;
+            String userDeDataDir = "/data/user_de/" + userId + "/" + pkgName;
+            out.append("OK\t").append(sanitize(pkgName)).append('\t').append(userId).append("\ttrue\ttrue\t")
+                    .append(item.uid).append('\t').append(item.enabled ? "true" : "false").append('\t')
+                    .append(item.versionCode).append('\t')
+                    .append(new File(userDataDir).isDirectory() ? "true" : "false").append('\t')
+                    .append(new File(userDeDataDir).isDirectory() ? "true" : "false").append("\tOK\n");
+        } catch (Throwable t) {
+            out.append("MISSING\t").append(sanitize(pkgName)).append('\t').append(userId)
+                    .append("\tfalse\tfalse\t-1\tfalse\t-1\tfalse\tfalse\t")
+                    .append(sanitize(t.getClass().getSimpleName())).append('\n');
+        }
+        return out.toString();
+    }
+
+    static synchronized String storageVolumeFactsOutput(int userId, String extraPath) {
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.storage_volume_facts.v1\n");
+        out.append("#fields\tkey\tpath\texists\tisDirectory\tcanRead\tcanWrite\ttotalBytes\tfreeBytes\tusableBytes\tuserId\tsource\n");
+        appendVolumePathFact(out, "data_user", "/data/user/" + userId, userId, "file");
+        appendVolumePathFact(out, "data_user_de", "/data/user_de/" + userId, userId, "file");
+        appendVolumePathFact(out, "media_user", "/data/media/" + userId, userId, "file");
+        appendVolumePathFact(out, "storage_emulated", "/storage/emulated/" + userId, userId, "file");
+        appendVolumePathFact(out, "android_data", "/storage/emulated/" + userId + "/Android/data", userId, "file");
+        appendVolumePathFact(out, "android_obb", "/storage/emulated/" + userId + "/Android/obb", userId, "file");
+        if (extraPath != null && extraPath.trim().length() > 0 && !"-".equals(extraPath.trim())) {
+            appendVolumePathFact(out, "target", extraPath.trim(), userId, "file");
+        }
+        try {
+            Context ctx = HiddenApiHelper.getContext();
+            Object sm = ctx.getSystemService("storage");
+            if (sm != null) {
+                try {
+                    Method m = sm.getClass().getMethod("getStorageVolumes");
+                    Object vols = m.invoke(sm);
+                    if (vols instanceof List) {
+                        int idx = 0;
+                        for (Object v : (List<?>) vols) {
+                            String desc = "volume" + idx;
+                            String state = "";
+                            try { desc = String.valueOf(v.getClass().getMethod("getDescription", Context.class).invoke(v, ctx)); } catch (Throwable ignored) {}
+                            try { state = String.valueOf(v.getClass().getMethod("getState").invoke(v)); } catch (Throwable ignored) {}
+                            out.append("VOLUME\t").append(sanitize(desc)).append('\t').append(sanitize(state))
+                                    .append("\tfalse\tfalse\tfalse\tfalse\t0\t0\t0\t").append(userId).append("\tStorageManager\n");
+                            idx++;
+                        }
+                    }
+                } catch (Throwable t) {
+                    out.append("WARN\tStorageManager\t").append(sanitize(t.getClass().getSimpleName()))
+                            .append("\tfalse\tfalse\tfalse\tfalse\t0\t0\t0\t").append(userId).append("\tStorageManager\n");
+                }
+            }
+        } catch (Throwable ignored) {}
+        return out.toString();
+    }
+
+    private static void appendVolumePathFact(StringBuilder out, String key, String path, int userId, String source) {
+        File f = new File(path);
+        out.append("OK\t").append(key).append('\t').append(sanitize(path)).append('\t')
+                .append(f.exists() ? "true" : "false").append('\t')
+                .append(f.isDirectory() ? "true" : "false").append('\t')
+                .append(f.canRead() ? "true" : "false").append('\t')
+                .append(f.canWrite() ? "true" : "false").append('\t')
+                .append(f.exists() ? f.getTotalSpace() : 0L).append('\t')
+                .append(f.exists() ? f.getFreeSpace() : 0L).append('\t')
+                .append(f.exists() ? f.getUsableSpace() : 0L).append('\t')
+                .append(userId).append('\t').append(source).append('\n');
+    }
+
+    static synchronized String homeImeLauncherFactsOutput(int userId, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.home_ime_launcher_facts.v1\n");
+        out.append("#fields\ttype\tpackage\tlabel\tinstalled\tuid\tenabled\tsource\treason\n");
+        HomeInfo home = defaultHomeInfo(userId);
+        ImeInfo ime = defaultImeInfo(userId);
+        appendPackageRefFact(out, "defaultHome", home.packageName, home.label, home.source, userId);
+        appendPackageRefFact(out, "defaultIme", ime.packageName, ime.label, ime.source, userId);
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        Intent intent = new Intent(Intent.ACTION_MAIN);
+        intent.addCategory(Intent.CATEGORY_HOME);
+        try {
+            List<android.content.pm.ResolveInfo> ris = pmHidden.queryIntentActivitiesAsUser(intent, 0, userId);
+            if (ris != null) {
+                for (android.content.pm.ResolveInfo ri : ris) {
+                    String pkg = ri != null && ri.activityInfo != null ? ri.activityInfo.packageName : "";
+                    if (pkg == null || pkg.length() == 0) continue;
+                    String label = "";
+                    try { label = String.valueOf(ri.loadLabel(pm)); } catch (Throwable ignored) {}
+                    appendPackageRefFact(out, "launcherCandidate", pkg, label, "queryIntentActivitiesAsUser", userId);
+                }
+            }
+        } catch (Throwable t) {
+            out.append("ERR\tlauncherCandidate\t\t\tfalse\t-1\tfalse\tqueryIntentActivitiesAsUser\t")
+                    .append(sanitize(t.getClass().getSimpleName())).append('\n');
+        }
+        return out.toString();
+    }
+
+    private static void appendPackageRefFact(StringBuilder out, String type, String pkg, String label, String source, int userId) {
+        String packageName = pkg == null ? "" : pkg.trim();
+        boolean installed = false;
+        int uid = -1;
+        boolean enabled = false;
+        String reason = packageName.isEmpty() ? "EMPTY" : "OK";
+        if (!packageName.isEmpty()) {
+            try {
+                Context ctx = HiddenApiHelper.getContext();
+                PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+                PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+                PackageInfo pi = pmHidden.getPackageInfoAsUser(packageName, PackageManager.GET_META_DATA, userId);
+                Item item = toItem(pm, pi, userId);
+                if (item != null) {
+                    installed = item.installed;
+                    uid = item.uid;
+                    enabled = item.enabled;
+                    if (label == null || label.length() == 0) label = item.label;
+                }
+            } catch (Throwable t) {
+                reason = t.getClass().getSimpleName();
+            }
+        }
+        out.append("OK\t").append(type).append('\t').append(sanitize(packageName)).append('\t')
+                .append(sanitize(label)).append('\t').append(installed ? "true" : "false").append('\t')
+                .append(uid).append('\t').append(enabled ? "true" : "false").append('\t')
+                .append(sanitize(source)).append('\t').append(sanitize(reason)).append('\n');
+    }
+
+
+    static synchronized String preRestorePackageStateBatch(int userId, String[] packageNames, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.pre_restore_package_state.v1\n");
+        out.append("#fields\tstatus\tpackage\tinstalledForUser\tuid\tversionCode\tversionName\tenabled\tsystem\tupdatedSystem\txposed\tcategory\tinstaller\tsourceDir\tpublicSourceDir\tsplitCount\tsplitSourceDirs\tdataDir\tdeDataDir\tuserDataExists\tuserDeDataExists\treason\tinstalledAnyUser\thidden\tsuspended\tinstallerPackage\tinstallSourcePackageName\tinitiatingPackageName\toriginatingPackageName\tfactsSource\n");
+        if (packageNames == null || packageNames.length == 0) {
+            appendPreRestoreMissingFact(out, userId, "", "BAD_ARGS", false);
+            return out.toString();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        boolean any = false;
+        for (String raw : packageNames) {
+            if (raw == null) continue;
+            String pkgName = raw.trim();
+            if (pkgName.isEmpty() || "refresh".equalsIgnoreCase(pkgName) || "--refresh".equalsIgnoreCase(pkgName)) continue;
+            any = true;
+            boolean anyUser = isInstalledAnyUser(pm, pmHidden, pkgName, userId);
+            try {
+                PackageInfo pkg = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, userId);
+                Item item = toItem(pm, pkg, userId);
+                if (item == null) {
+                    appendPreRestoreMissingFact(out, userId, pkgName, "ITEM_NULL", anyUser);
+                } else {
+                    appendPreRestoreItemFact(out, pm, pmHidden, item, "OK", anyUser);
+                }
+            } catch (Throwable t) {
+                appendPreRestoreMissingFact(out, userId, pkgName, t.getClass().getSimpleName(), anyUser);
+            }
+        }
+        if (!any) appendPreRestoreMissingFact(out, userId, "", "BAD_ARGS", false);
+        return out.toString();
+    }
+
+    static synchronized String installerContextFacts(int userId, String targetPackage, String installerPackage, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        String target = targetPackage == null ? "" : targetPackage.trim();
+        String installer = installerPackage == null ? "" : installerPackage.trim();
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.installer_context_facts.v1\n");
+        out.append("#fields\tstatus\ttargetPackage\tinstallerPackage\tuserId\ttargetInstalled\ttargetInstaller\tinstallerInstalled\tinstallerEnabled\tinstallerUid\tinstallerDataDir\tinstallerDeDataDir\tinstallerVersionCode\tinstallerIsPlay\tusableForPm\tusableForUidHybrid\treason\n");
+        if (target.isEmpty() || installer.isEmpty()) {
+            out.append("MISSING\t").append(sanitize(target)).append('\t').append(sanitize(installer)).append('\t').append(userId)
+                    .append("\tfalse\t\tfalse\tfalse\t-1\t\t\t-1\tfalse\tfalse\tfalse\tBAD_ARGS\n");
+            return out.toString();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        String targetInstaller = "";
+        boolean targetInstalled = false;
+        try {
+            PackageInfo targetPi = pmHidden.getPackageInfoAsUser(target, PackageManager.GET_META_DATA, userId);
+            targetInstalled = targetPi != null && targetPi.applicationInfo != null;
+            try { targetInstaller = pm.getInstallerPackageName(target); } catch (Throwable ignored) { targetInstaller = ""; }
+        } catch (Throwable ignored) {}
+        try {
+            PackageInfo pi = pmHidden.getPackageInfoAsUser(installer, PackageManager.GET_META_DATA, userId);
+            Item item = toItem(pm, pi, userId);
+            if (item == null) throw new IllegalStateException("ITEM_NULL");
+            String dataDir = "/data/user/" + userId + "/" + installer;
+            String deDataDir = "/data/user_de/" + userId + "/" + installer;
+            boolean dataOk = new File(dataDir).isDirectory();
+            boolean deDataOk = new File(deDataDir).isDirectory();
+            boolean uidOk = item.uid >= 0;
+            boolean usablePm = item.enabled && uidOk;
+            boolean usableHybrid = usablePm && dataOk;
+            out.append("OK\t").append(sanitize(target)).append('\t').append(sanitize(installer)).append('\t').append(userId).append('\t')
+                    .append(targetInstalled ? "true" : "false").append('\t').append(sanitize(targetInstaller)).append('\t')
+                    .append("true\t").append(item.enabled ? "true" : "false").append('\t').append(item.uid).append('\t')
+                    .append(sanitize(dataDir)).append('\t').append(sanitize(deDataDir)).append('\t').append(item.versionCode).append('\t')
+                    .append("com.android.vending".equals(installer) ? "true" : "false").append('\t')
+                    .append(usablePm ? "true" : "false").append('\t').append(usableHybrid ? "true" : "false").append('\t')
+                    .append(dataOk ? "OK" : (deDataOk ? "DATA_DIR_MISSING_DE_EXISTS" : "DATA_DIR_MISSING")).append("\n");
+        } catch (Throwable t) {
+            out.append("MISSING\t").append(sanitize(target)).append('\t').append(sanitize(installer)).append('\t').append(userId)
+                    .append("\t").append(targetInstalled ? "true" : "false").append('\t').append(sanitize(targetInstaller))
+                    .append("\tfalse\tfalse\t-1\t\t\t-1\t")
+                    .append("com.android.vending".equals(installer) ? "true" : "false")
+                    .append("\tfalse\tfalse\t").append(sanitize(t.getClass().getSimpleName())).append("\n");
+        }
+        return out.toString();
+    }
+
+    private static void appendPreRestoreItemFact(StringBuilder out, PackageManager pm, PackageManagerHidden pmHidden, Item item, String reason, boolean installedAnyUser) {
+        String splits = item.splitSourceDirs == null ? "" : String.join("|", item.splitSourceDirs);
+        String userDataDir = item.packageName == null || item.packageName.isEmpty() ? "" : "/data/user/" + item.userId + "/" + item.packageName;
+        String userDeDataDir = item.packageName == null || item.packageName.isEmpty() ? "" : "/data/user_de/" + item.userId + "/" + item.packageName;
+        boolean hidden = isApplicationHidden(pm, item.packageName, item.userId);
+        boolean suspended = isPackageSuspended(pm, item.packageName);
+        String installerPkg = item.installerPackageName == null ? "" : item.installerPackageName;
+        String installSource = installerPkg;
+        String initiating = installerPkg;
+        String originating = "";
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                Object info = pm.getClass().getMethod("getInstallSourceInfo", String.class).invoke(pm, item.packageName);
+                if (info != null) {
+                    try { installSource = String.valueOf(info.getClass().getMethod("getInstallingPackageName").invoke(info)); } catch (Throwable ignored) {}
+                    try { initiating = String.valueOf(info.getClass().getMethod("getInitiatingPackageName").invoke(info)); } catch (Throwable ignored) {}
+                    try { originating = String.valueOf(info.getClass().getMethod("getOriginatingPackageName").invoke(info)); } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+        out.append("OK").append('\t')
+                .append(sanitize(item.packageName)).append('\t')
+                .append(item.installed).append('\t')
+                .append(item.uid).append('\t')
+                .append(item.versionCode).append('\t')
+                .append(sanitize(item.versionName)).append('\t')
+                .append(item.enabled).append('\t')
+                .append(item.system).append('\t')
+                .append(item.updatedSystem).append('\t')
+                .append(item.xposed).append('\t')
+                .append(sanitize(item.category)).append('\t')
+                .append(sanitize(installerPkg)).append('\t')
+                .append(sanitize(item.sourceDir)).append('\t')
+                .append(sanitize(item.publicSourceDir)).append('\t')
+                .append(item.splitCount).append('\t')
+                .append(sanitize(splits)).append('\t')
+                .append(sanitize(userDataDir)).append('\t')
+                .append(sanitize(userDeDataDir)).append('\t')
+                .append(!userDataDir.isEmpty() && new File(userDataDir).isDirectory()).append('\t')
+                .append(!userDeDataDir.isEmpty() && new File(userDeDataDir).isDirectory()).append('\t')
+                .append(sanitize(reason)).append('\t')
+                .append(installedAnyUser ? "true" : "false").append('\t')
+                .append(hidden ? "true" : "false").append('\t')
+                .append(suspended ? "true" : "false").append('\t')
+                .append(sanitize(installerPkg)).append('\t')
+                .append(sanitize(installSource)).append('\t')
+                .append(sanitize(initiating)).append('\t')
+                .append(sanitize(originating)).append('\t')
+                .append("PackageManager").append('\n');
+    }
+
+    private static void appendPreRestoreMissingFact(StringBuilder out, int userId, String pkgName, String reason, boolean installedAnyUser) {
+        String pkg = pkgName == null ? "" : pkgName.trim();
+        String userDataDir = pkg.isEmpty() ? "" : "/data/user/" + userId + "/" + pkg;
+        String userDeDataDir = pkg.isEmpty() ? "" : "/data/user_de/" + userId + "/" + pkg;
+        out.append("MISSING").append('\t')
+                .append(sanitize(pkg)).append('\t')
+                .append("false\t-1\t-1\t\tfalse\tfalse\tfalse\tfalse\t\t\t\t\t0\t\t")
+                .append(sanitize(userDataDir)).append('\t')
+                .append(sanitize(userDeDataDir)).append('\t')
+                .append(!userDataDir.isEmpty() && new File(userDataDir).isDirectory()).append('\t')
+                .append(!userDeDataDir.isEmpty() && new File(userDeDataDir).isDirectory()).append('\t')
+                .append(sanitize(reason)).append('\t')
+                .append(installedAnyUser ? "true" : "false")
+                .append("\tfalse\tfalse\t\t\t\t\tPackageManager\n");
+    }
+
+    private static boolean isInstalledAnyUser(PackageManager pm, PackageManagerHidden pmHidden, String pkgName, int preferredUserId) {
+        int[] users = new int[]{preferredUserId, 0, 10, 11, 12, 13, 14, 15, 999};
+        Set<Integer> seen = new HashSet<>();
+        for (int u : users) {
+            if (u < 0 || seen.contains(u)) continue;
+            seen.add(u);
+            try {
+                PackageInfo pi = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, u);
+                if (pi != null && pi.applicationInfo != null) return true;
+            } catch (Throwable ignored) {}
+        }
+        for (int u = 0; u <= 15; u++) {
+            if (seen.contains(u)) continue;
+            try {
+                PackageInfo pi = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, u);
+                if (pi != null && pi.applicationInfo != null) return true;
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static boolean isApplicationHidden(PackageManager pm, String packageName, int userId) {
+        if (packageName == null || packageName.length() == 0) return false;
+        try {
+            Method m = pm.getClass().getMethod("getApplicationHiddenSettingAsUser", String.class, android.os.UserHandle.class);
+            Object r = m.invoke(pm, packageName, UserHandleHidden.of(userId));
+            return Boolean.TRUE.equals(r);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isPackageSuspended(PackageManager pm, String packageName) {
+        if (packageName == null || packageName.length() == 0) return false;
+        try {
+            Method m = pm.getClass().getMethod("isPackageSuspended", String.class);
+            Object r = m.invoke(pm, packageName);
+            return Boolean.TRUE.equals(r);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    static synchronized String packageFactsBatch(int userId, String[] packageNames, boolean refresh) throws Exception {
+        if (refresh) clearCache();
+        StringBuilder out = new StringBuilder();
+        out.append("#schema\tspeedbackup.pm_facts.v1\n");
+        out.append("#fields\tpackage\tinstalled\tuid\tversionCode\tversionName\tenabled\tsystem\tupdatedSystem\txposed\tcategory\tinstaller\tsourceDir\tpublicSourceDir\tsplitCount\tsplitSourceDirs\tdataDir\tdeDataDir\tuserDataExists\tuserDeDataExists\treason\n");
+        if (packageNames == null || packageNames.length == 0) {
+            out.append("MISSING\t\tfalse\t-1\t-1\t\tfalse\tfalse\tfalse\tfalse\t\t\t\t\t0\t\t\t\tfalse\tfalse\tBAD_ARGS\n");
+            return out.toString();
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManager pm = PackageManagerUtil.getPackageManager(ctx).packageManager();
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        boolean any = false;
+        for (String raw : packageNames) {
+            if (raw == null) continue;
+            String pkgName = raw.trim();
+            if (pkgName.isEmpty() || "refresh".equalsIgnoreCase(pkgName) || "--refresh".equalsIgnoreCase(pkgName)) continue;
+            any = true;
+            try {
+                PackageInfo pkg = pmHidden.getPackageInfoAsUser(pkgName, PackageManager.GET_META_DATA, userId);
+                Item item = toItem(pm, pkg, userId);
+                if (item == null) {
+                    appendMissingFact(out, userId, pkgName, "ITEM_NULL");
+                } else {
+                    appendItemFact(out, item, "OK");
+                }
+            } catch (Throwable t) {
+                appendMissingFact(out, userId, pkgName, t.getClass().getSimpleName());
+            }
+        }
+        if (!any) appendMissingFact(out, userId, "", "BAD_ARGS");
+        return out.toString();
+    }
+
+    private static void appendItemFact(StringBuilder out, Item item, String reason) {
+        String splits = item.splitSourceDirs == null ? "" : String.join("|", item.splitSourceDirs);
+        String userDataDir = item.packageName == null || item.packageName.isEmpty() ? "" : "/data/user/" + item.userId + "/" + item.packageName;
+        String userDeDataDir = item.packageName == null || item.packageName.isEmpty() ? "" : "/data/user_de/" + item.userId + "/" + item.packageName;
+        out.append("OK").append('\t')
+                .append(sanitize(item.packageName)).append('\t')
+                .append(item.installed).append('\t')
+                .append(item.uid).append('\t')
+                .append(item.versionCode).append('\t')
+                .append(sanitize(item.versionName)).append('\t')
+                .append(item.enabled).append('\t')
+                .append(item.system).append('\t')
+                .append(item.updatedSystem).append('\t')
+                .append(item.xposed).append('\t')
+                .append(sanitize(item.category)).append('\t')
+                .append(sanitize(item.installerPackageName)).append('\t')
+                .append(sanitize(item.sourceDir)).append('\t')
+                .append(sanitize(item.publicSourceDir)).append('\t')
+                .append(item.splitCount).append('\t')
+                .append(sanitize(splits)).append('\t')
+                .append(sanitize(userDataDir)).append('\t')
+                .append(sanitize(userDeDataDir)).append('\t')
+                .append(!userDataDir.isEmpty() && new File(userDataDir).isDirectory()).append('\t')
+                .append(!userDeDataDir.isEmpty() && new File(userDeDataDir).isDirectory()).append('\t')
+                .append(sanitize(reason)).append('\n');
+    }
+
+    private static void appendMissingFact(StringBuilder out, int userId, String pkgName, String reason) {
+        String pkg = pkgName == null ? "" : pkgName.trim();
+        String userDataDir = pkg.isEmpty() ? "" : "/data/user/" + userId + "/" + pkg;
+        String userDeDataDir = pkg.isEmpty() ? "" : "/data/user_de/" + userId + "/" + pkg;
+        out.append("MISSING").append('\t')
+                .append(sanitize(pkg)).append('\t')
+                .append("false\t-1\t-1\t\tfalse\tfalse\tfalse\tfalse\t\t\t\t\t0\t\t")
+                .append(sanitize(userDataDir)).append('\t')
+                .append(sanitize(userDeDataDir)).append('\t')
+                .append(!userDataDir.isEmpty() && new File(userDataDir).isDirectory()).append('\t')
+                .append(!userDeDataDir.isEmpty() && new File(userDeDataDir).isDirectory()).append('\t')
+                .append(sanitize(reason)).append('\n');
+    }
+
+    private static String statusMissing(int userId, String packageName, String reason) {
+        String pkgName = packageName == null ? "" : packageName.trim();
+        JsonObject o = new JsonObject();
+        o.addProperty("schema", "speedbackup.package_status.v1");
+        o.addProperty("recordType", "packageStatus");
+        o.addProperty("userId", userId);
+        o.addProperty("packageName", pkgName);
+        o.addProperty("installed", false);
+        o.addProperty("uid", -1);
+        o.addProperty("versionCode", -1L);
+        o.addProperty("versionName", "");
+        o.addProperty("enabled", false);
+        o.addProperty("suspended", false);
+        o.addProperty("sourceDir", "");
+        o.add("splitSourceDirs", new JsonArray());
+        o.addProperty("splitCount", 0);
+        o.addProperty("source", "packageManager");
+        o.addProperty("reason", sanitize(reason));
+        addDataDirs(o, userId, pkgName);
+        return GSON.toJson(o) + "\n";
+    }
+
+    private static void addDataDirs(JsonObject o, int userId, String packageName) {
+        String pkgName = packageName == null ? "" : packageName.trim();
+        String userDataDir = pkgName.isEmpty() ? "" : "/data/user/" + userId + "/" + pkgName;
+        String userDeDataDir = pkgName.isEmpty() ? "" : "/data/user_de/" + userId + "/" + pkgName;
+        o.addProperty("dataDir", userDataDir);
+        o.addProperty("deDataDir", userDeDataDir);
+        o.addProperty("userDataExists", !userDataDir.isEmpty() && new File(userDataDir).isDirectory());
+        o.addProperty("userDeDataExists", !userDeDataDir.isEmpty() && new File(userDeDataDir).isDirectory());
+    }
+
+    static synchronized List<Item> snapshot(int userId, boolean refresh) throws Exception {
+        Locale locale = AppLocale.parse(System.getenv("APP_LABEL_LOCALE"));
+        String cacheKey = userId + "|" + (locale == null ? "" : locale.toLanguageTag());
+        if (!refresh) {
+            List<Item> cached = CACHE.get(cacheKey);
+            if (cached != null) return cached;
+        }
+        Context ctx = HiddenApiHelper.getContext();
+        PackageManagerUtil.PackageManagerWithLocale pmWithLocale = PackageManagerUtil.getPackageManager(ctx);
+        PackageManager pm = pmWithLocale.packageManager();
+        Locale effectiveLocale = pmWithLocale.locale();
+        if (effectiveLocale == null) effectiveLocale = locale;
+        PackageManagerHidden pmHidden = Refine.unsafeCast(pm);
+        List<PackageInfo> packages = pmHidden.getInstalledPackagesAsUser(PackageManager.GET_META_DATA, userId);
+        List<Item> items = new ArrayList<>();
+        if (packages != null) {
+            for (PackageInfo pkg : packages) {
+                Item item = toItem(pm, pkg, userId);
+                if (item != null && item.packageName != null && !item.packageName.isEmpty()) {
+                    items.add(item);
+                }
+            }
+        }
+        Collator collator = Collator.getInstance(effectiveLocale != null ? effectiveLocale : Locale.getDefault());
+        items.sort((a, b) -> collator.getCollationKey(a.label == null ? "" : a.label)
+                .compareTo(collator.getCollationKey(b.label == null ? "" : b.label)));
+        CACHE.put(cacheKey, items);
+        return items;
+    }
+
+    static synchronized void clearCache() {
+        CACHE.clear();
+    }
+
+    private static Item toItem(PackageManager pm, PackageInfo pkg, int userId) {
+        try {
+            if (pkg == null || pkg.applicationInfo == null || pkg.packageName == null) return null;
+            ApplicationInfo ai = pkg.applicationInfo;
+            Item item = new Item();
+            item.userId = userId;
+            item.packageName = pkg.packageName;
+            item.label = safeLabel(pm, ai, pkg.packageName);
+            item.uid = ai.uid;
+            item.versionCode = longVersionCode(pkg);
+            item.versionName = pkg.versionName == null ? "" : pkg.versionName;
+            item.enabled = ai.enabled;
+            item.installed = true;
+            item.system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+            item.updatedSystem = (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
+            item.xposed = isXposed(ai);
+            item.sourceDir = ai.sourceDir == null ? "" : ai.sourceDir;
+            item.publicSourceDir = ai.publicSourceDir == null ? "" : ai.publicSourceDir;
+            try { item.installerPackageName = pm.getInstallerPackageName(pkg.packageName); } catch (Throwable ignored) { item.installerPackageName = ""; }
+            item.splitSourceDirs = ai.splitSourceDirs == null ? new String[0] : ai.splitSourceDirs;
+            item.splitCount = item.splitSourceDirs.length;
+            List<String> flags = new ArrayList<>();
+            if (!item.system) flags.add("user");
+            if (item.system) flags.add("system");
+            if (item.xposed) flags.add("xposed");
+            item.flag = String.join("|", flags);
+            if (item.xposed) item.category = "xposed";
+            else if (item.system) item.category = "system";
+            else item.category = "user";
+            return item;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean matchesFilter(Item item, String filter) {
+        if (item == null) return false;
+        if (filter == null || filter.isEmpty() || "all".equals(filter)) return true;
+        String f = filter.trim();
+        if (f.startsWith("packages:")) {
+            String list = f.substring("packages:".length());
+            if (list.isEmpty()) return false;
+            for (String p : list.split("[,|\\s]+")) {
+                if (p != null && p.equals(item.packageName)) return true;
+            }
+            return false;
+        }
+        List<String> fs = Arrays.asList(filter.split("\\|"));
+        return (fs.contains("user") && !item.system)
+                || (fs.contains("system") && item.system)
+                || (fs.contains("xposed") && item.xposed);
+    }
+
+    private static String safeLabel(PackageManager pm, ApplicationInfo ai, String fallback) {
+        try {
+            CharSequence label = ai.loadLabel(pm);
+            if (label != null) {
+                String value = safePathLabel(label.toString(), fallback);
+                if (!value.isEmpty()) return value;
+            }
+        } catch (Throwable ignored) {
+        }
+        return safePathLabel(fallback, "app");
+    }
+
+    private static long longVersionCode(PackageInfo pkg) {
+        try {
+            if (Build.VERSION.SDK_INT >= 28) return pkg.getLongVersionCode();
+        } catch (Throwable ignored) {
+        }
+        try {
+            return pkg.versionCode;
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    private static String removeSpaces(String string) {
+        return safePathLabel(string, "app");
+    }
+
+    private static String safePathLabel(String string, String fallback) {
+        String value = string == null ? "" : string.replaceAll("\\s+", "").replace('/', '_').replace('\\', '_').replace("..", "__");
+        if (value.isEmpty() || ".".equals(value) || "..".equals(value)) {
+            value = fallback == null ? "" : fallback.replaceAll("[^A-Za-z0-9._-]", "_").replace("..", "__");
+        }
+        if (value.isEmpty() || ".".equals(value) || "..".equals(value)) value = "app";
+        return value;
+    }
+
+    private static String sanitize(String value) {
+        if (value == null) return "";
+        return value.replace('\n', '_').replace('\r', '_').replace('\t', '_').replace(' ', '_');
+    }
+
+    private static boolean isXposed(ApplicationInfo info) {
+        if (info == null) return false;
+        try {
+            if (info.metaData != null && info.metaData.containsKey(XPOSED_METADATA)) return true;
+        } catch (Throwable ignored) {
+        }
+        return isModernModules(info);
+    }
+
+    private static boolean isModernModules(ApplicationInfo info) {
+        String[] apks;
+        if (info == null || info.sourceDir == null) return false;
+        if (info.splitSourceDirs != null) {
+            apks = Arrays.copyOf(info.splitSourceDirs, info.splitSourceDirs.length + 1);
+            apks[info.splitSourceDirs.length] = info.sourceDir;
+        } else {
+            apks = new String[]{info.sourceDir};
+        }
+        for (String apk : apks) {
+            if (apk == null || apk.isEmpty()) continue;
+            try (ZipFile zip = new ZipFile(apk)) {
+                if (zip.getEntry("META-INF/xposed/java_init.list") != null) return true;
+            } catch (IOException ignored) {
+            }
+        }
+        return false;
+    }
+
+    private static int parseInt(String raw, int fallback) {
+        try { return Integer.parseInt(raw == null ? "" : raw.trim()); } catch (Throwable ignored) { return fallback; }
+    }
+
+    private static Set<String> parsePackageSet(String raw) {
+        Set<String> out = new HashSet<>();
+        if (raw == null || raw.trim().isEmpty()) return out;
+        for (String p : raw.split("[,|\\s]+")) {
+            if (p == null) continue;
+            String pkg = p.trim();
+            if (pkg.matches("[A-Za-z0-9_.-]+") && !pkg.startsWith(".") && !pkg.contains("..")) out.add(pkg);
+        }
+        return out;
+    }
+
+    private static HomeInfo defaultHomeInfo(int userId) {
+        HomeInfo out = new HomeInfo();
+        try {
+            AppStateEngine.EngineResponse response = AppStateEngine.defaultHome(userId);
+            String body = response == null ? "" : response.body;
+            for (String line : body.split("\\n")) {
+                if (line == null || line.trim().isEmpty()) continue;
+                JsonObject o = GSON.fromJson(line, JsonObject.class);
+                if (o == null || !"defaultHome".equals(jsonString(o, "recordType"))) continue;
+                JsonObject result = o.has("result") && o.get("result").isJsonObject()
+                        ? o.getAsJsonObject("result") : null;
+                String resultName = result == null ? "" : jsonString(result, "name");
+                if (!"OK".equals(resultName) || jsonBoolean(o, "isResolver", true)) continue;
+                String pkg = jsonString(o, "packageName");
+                if (!pkg.matches("[A-Za-z0-9_.-]+") || pkg.startsWith(".") || pkg.contains("..")) continue;
+                out.packageName = pkg;
+                out.label = safePathLabel(jsonString(o, "label"), pkg);
+                out.source = jsonString(o, "source");
+                return out;
+            }
+        } catch (Throwable ignored) {}
+        return out;
+    }
+
+
+    private static final class ImeInfo {
+        String packageName = "";
+        String label = "";
+        String source = "";
+    }
+
+    private static ImeInfo defaultImeInfo(int userId) {
+        ImeInfo out = new ImeInfo();
+        try {
+            AppStateEngine.EngineResponse response = AppStateEngine.defaultIme(userId);
+            String body = response == null ? "" : response.body;
+            for (String line : body.split("\\n")) {
+                if (line == null || line.trim().isEmpty()) continue;
+                JsonObject o = GSON.fromJson(line, JsonObject.class);
+                if (o == null || !"defaultIme".equals(jsonString(o, "recordType"))) continue;
+                JsonObject result = o.has("result") && o.get("result").isJsonObject()
+                        ? o.getAsJsonObject("result") : null;
+                String resultName = result == null ? "" : jsonString(result, "name");
+                if (!"OK".equals(resultName)) continue;
+                String pkg = jsonString(o, "packageName");
+                if (!pkg.matches("[A-Za-z0-9_.-]+") || pkg.startsWith(".") || pkg.contains("..")) continue;
+                out.packageName = pkg;
+                out.label = safePathLabel(jsonString(o, "label"), pkg);
+                out.source = jsonString(o, "source");
+                return out;
+            }
+        } catch (Throwable ignored) {}
+        return out;
+    }
+
+    private static String jsonString(JsonObject object, String key) {
+        try {
+            if (object != null && object.has(key) && !object.get(key).isJsonNull()) {
+                return object.get(key).getAsString();
+            }
+        } catch (Throwable ignored) {}
+        return "";
+    }
+
+    private static boolean jsonBoolean(JsonObject object, String key, boolean fallback) {
+        try {
+            if (object != null && object.has(key) && !object.get(key).isJsonNull()) {
+                return object.get(key).getAsBoolean();
+            }
+        } catch (Throwable ignored) {}
+        return fallback;
+    }
+
+    static final class HomeInfo {
+        String packageName = "";
+        String label = "";
+        String source = "";
+    }
+
+    static final class Item {
+        int userId;
+        String packageName;
+        String label;
+        int uid;
+        long versionCode;
+        String versionName;
+        boolean enabled;
+        boolean installed;
+        boolean system;
+        boolean updatedSystem;
+        boolean xposed;
+        String flag;
+        String category;
+        String sourceDir;
+        String publicSourceDir;
+        String installerPackageName;
+        String[] splitSourceDirs;
+        int splitCount;
+
+        JsonObject toJson() {
+            JsonObject o = new JsonObject();
+            o.addProperty("schema", "speedbackup.app_inventory.v1");
+            o.addProperty("userId", userId);
+            o.addProperty("packageName", packageName == null ? "" : packageName);
+            o.addProperty("label", label == null ? "" : label);
+            o.addProperty("uid", uid);
+            o.addProperty("versionCode", versionCode);
+            o.addProperty("versionName", versionName == null ? "" : versionName);
+            o.addProperty("enabled", enabled);
+            o.addProperty("installed", installed);
+            o.addProperty("system", system);
+            o.addProperty("updatedSystem", updatedSystem);
+            o.addProperty("xposed", xposed);
+            o.addProperty("flag", flag == null ? "" : flag);
+            o.addProperty("category", category == null ? "" : category);
+            o.addProperty("sourceDir", sourceDir == null ? "" : sourceDir);
+            o.addProperty("publicSourceDir", publicSourceDir == null ? "" : publicSourceDir);
+            o.addProperty("installerPackageName", installerPackageName == null ? "" : installerPackageName);
+            JsonArray splits = new JsonArray();
+            if (splitSourceDirs != null) {
+                for (String split : splitSourceDirs) {
+                    if (split != null && !split.isEmpty()) splits.add(split);
+                }
+            }
+            o.add("splitSourceDirs", splits);
+            o.addProperty("splitCount", splitCount);
+            return o;
+        }
+    }
+}

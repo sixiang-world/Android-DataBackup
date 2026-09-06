@@ -1,21 +1,46 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+-keep class com.xayah.dex.HiddenApiUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.NotificationUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.NetworkUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.SsaidUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.HttpUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.CCUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.WebDavUtil { public static void main(java.lang.String[]); }
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+-keep class android.** { *; }
+-keep class com.android.** { *; }
+-keep class libcore.** { *; }
+-keep class dev.rikka.tools.refine.** { *; }
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+-keep class * implements io.ktor.client.HttpClientEngineContainer { *; }
+-keep class io.ktor.client.engine.cio.CIO { *; }
+-keep class io.ktor.client.engine.cio.CIOEngineContainer { *; }
+-keep class org.slf4j.** { *; }
+-keep class org.slf4j.nop.** { *; }
+-keep class * implements org.slf4j.spi.SLF4JServiceProvider { *; }
+-dontwarn io.ktor.**
+-dontwarn kotlinx.coroutines.**
+-dontwarn kotlinx.serialization.**
+-dontwarn nl.adaptivity.xmlutil.**
+-dontwarn org.slf4j.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+-keepattributes *Annotation*,InnerClasses,EnclosingMethod
+-dontobfuscate
+-dontwarn **
+
+-keep class com.xayah.dex.SmbScanUtil { public static void main(java.lang.String[]); }
+-keep class com.xayah.dex.AppStateUtil { public static void main(java.lang.String[]); }
+
+# LSPosed AndroidHiddenApiBypass 6.1: keep full helper graph.
+-keep class org.lsposed.hiddenapibypass.** { *; }
+-keep class com.xayah.dex.HiddenApiBypassBridge { *; }
+
+# SpeedBackup 464 r3: keep unified root daemon CLI entry and all members.
+-keep class com.xayah.dex.SpeedBackupRootDaemon { *; }
+
+# SpeedBackup r501: keep root daemon supervisor CLI entry; R8 may strip it because it is only invoked from tools.sh app_process.
+-keep class com.xayah.dex.DaemonSupervisorUtil { *; }
+
+# SpeedBackup r43: keep inventory helper used by HiddenApiUtil/root daemon.
+-keep class com.xayah.dex.AppInventoryUtil { *; }
+
+# SpeedBackup r201: durable display-timeout transaction and watchdog must survive R8.

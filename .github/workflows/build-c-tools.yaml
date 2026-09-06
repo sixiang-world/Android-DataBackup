@@ -1,0 +1,74 @@
+name: Build C Tools
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'C/**'
+      - '.github/workflows/build-c-tools.yaml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'C/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "Build C Native Tools"
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+
+    permissions:
+      contents: write
+
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Build C tools
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          API=28
+
+          case "${{ matrix.abi }}" in
+            arm64-v8a)      TARGET=aarch64-linux-android ;;
+            armeabi-v7a)    TARGET=armv7a-linux-androideabi ;;
+            x86)            TARGET=i686-linux-android ;;
+            x86_64)         TARGET=x86_64-linux-android ;;
+          esac
+
+          CC="$TOOLCHAIN/bin/${TARGET}${API}-clang"
+          STRIP="$TOOLCHAIN/bin/llvm-strip"
+
+          mkdir -p artifacts-c/${{ matrix.abi }}
+
+          CFLAGS="-O3 -ffunction-sections -fdata-sections -Wl,--gc-sections -static"
+
+          for src in C/*.c; do
+            name=$(basename "$src" .c)
+            echo "Building $name for ${{ matrix.abi }}..."
+            $CC $CFLAGS "$src" -o "artifacts-c/${{ matrix.abi }}/$name"
+            $STRIP "artifacts-c/${{ matrix.abi }}/$name"
+          done
+
+          ls -la artifacts-c/${{ matrix.abi }}/
+
+      - name: Upload C tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-tools-${{ matrix.abi }}
+          path: 'artifacts-c/${{ matrix.abi }}/*'
+          retention-days: 30

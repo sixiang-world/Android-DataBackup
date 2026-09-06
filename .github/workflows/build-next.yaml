@@ -1,0 +1,83 @@
+name: Build Next (source-next)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'source-next/**'
+      - '.github/workflows/build-next.yaml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'source-next/**'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build:
+    name: "Build APK (source-next)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source-next
+
+    permissions:
+      contents: write
+
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Validate gradle wrapper
+        uses: gradle/wrapper-validation-action@v3
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android
+
+      - name: Setup gradle
+        uses: gradle/gradle-build-action@v3
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build with gradle
+        id: gradle
+        run: |
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            ./gradlew assembleDebug --parallel
+          else
+            ./gradlew assembleRelease --parallel
+          fi
+
+      - name: Move APKs
+        run: |
+          mkdir -p ../artifacts
+          find . -path "*/build/outputs/apk/*/*.apk" -exec cp {} ../artifacts/ \;
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: APKs-source-next
+          path: 'artifacts/*.apk'
+          retention-days: 30
